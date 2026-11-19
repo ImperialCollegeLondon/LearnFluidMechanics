@@ -1,0 +1,18 @@
+# Install:  python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+# The same file works on a dev machine and on the Raspberry Pi; markers pick the right set.
+
+# --- Everywhere ---
+numpy
+scipy
+pyqtgraph
+
+# --- Dev machine only ---
+# On the Pi, PyQt5 has no PyPI wheel (pip would try a very long source build);
+# install it with apt instead: sudo apt install python3-pyqt5  (see README.md)
+PyQt5; platform_machine != "armv7l" and platform_machine != "aarch64"
+
+# --- Raspberry Pi hardware only (prc.py simulates these when absent) ---
+Adafruit-ADS1x15; platform_system == "Linux" and (platform_machine == "armv7l" or platform_machine == "aarch64")
+adafruit-circuitpython-mcp9600; platform_system == "Linux" and (platform_machine == "armv7l" or platform_machine == "aarch64")
+Adafruit-Blinka; platform_system == "Linux" and (platform_machine == "armv7l" or platform_machine == "aarch64")
+picamera; platform_system == "Linux" and (platform_machine == "armv7l" or platform_machine == "aarch64")
