@@ -36,7 +36,8 @@ class FakeADC:
     """ADS1115 replacement. Returns counts that prc.py's conversion maps back to sim pressure."""
 
     def read_adc(self, channel, gain=1.0):
-        p = sim_pressure_bar() * (1.0 if channel == 0 else 0.97) + random.gauss(0, 0.01)
+        # ch0 = P1 upstream reservoir; ch1 = P2 downstream plenum (only slightly above atm)
+        p = sim_pressure_bar() * (1.0 if channel == 0 else 0.03) + random.gauss(0, 0.01)
         # Invert prc.py: p = (counts/32767*6.144*50 - 25) * 0.0689 * 0.75
         counts = (p / (0.0689 * 0.75) + 25) / (50 * 6.144) * 32767
         return int(max(-32768, min(32767, counts)))
@@ -54,28 +55,61 @@ class FakeThermocouple:
         return self.base_c - 8.0 * (1 - frac) + random.gauss(0, 0.05)
 
 
+P_ATM = 1.01625
+
+# prc.py sets this to a function p0_abs_bar -> 4 Pax readings from nozzle theory,
+# so simulated taps show isentropic expansion and a shock moving through as the tank empties.
+PAX_MODEL = None
+
+
 def fake_pax():
-    """Four axial nozzle-wall pressures, falling along the nozzle."""
-    p = sim_pressure_bar()
-    return [p * k + random.gauss(0, 0.01) for k in (0.6, 0.35, 0.2, 0.15)]
+    """Four nozzle-wall pressures, as LabVIEW would send them."""
+    p0 = sim_pressure_bar() + P_ATM  # absolute stagnation pressure
+    if PAX_MODEL is not None:
+        base = PAX_MODEL(p0)
+    else:  # crude fallback: falling pressures along the nozzle
+        base = [p0 * k for k in (0.53, 0.35, 0.2, 0.13)]
+    return [v + random.gauss(0, 0.01) for v in base]
+
+
+# Fake camera view of the nozzle (camera pixels). prc.py uses these to line up the default overlay.
+CAM_THROAT_PX = (110, 300)   # (x, y) of the throat on the flat wall (raw image: contour above it)
+CAM_PX_PER_MM = 7.0
+NOZZLE = None                # prc.py sets to a nozzle_theory.Nozzle so the fake view shows the real profile
+SHOCK_X = None               # prc.py sets to a function p0_abs_bar -> shock x (mm from throat) or None
 
 
 class FakeCamera:
-    """Test pattern (gradient + grid) with a red 'shock' bar that moves with the blowdown."""
+    """Schlieren-ish side view of the half nozzle: grey walls, dark channel, and a bright
+    normal shock at its theoretical position for the current simulated tank pressure."""
 
     def __init__(self, width, height):
         self.w, self.h = width, height
-        base = np.zeros((height, width, 3), np.uint8)
-        base[..., 0] = np.linspace(0, 60, width, dtype=np.uint8)[None, :]
-        base[..., 1] = np.linspace(0, 60, height, dtype=np.uint8)[:, None]
-        base[..., 2] = 40
-        base[::40, :, :] = 90
-        base[:, ::40, :] = 90
-        self.base = base
+        tx, ty = CAM_THROAT_PX
+        self.x_mm = (np.arange(width) - tx) / CAM_PX_PER_MM
+        img = np.full((height, width, 3), 85, np.uint8)            # metal
+        img[..., 2] = 95
+        self.upper = np.full(width, ty, dtype=int)
+        if NOZZLE is not None:
+            x_clip = np.clip(self.x_mm, -3.0, NOZZLE.x_exit)
+            h_mm = np.array([NOZZLE.height(x) for x in x_clip])
+            self.upper = (ty - h_mm * CAM_PX_PER_MM).astype(int)
+            beyond = self.x_mm > NOZZLE.x_exit                       # open downstream plenum
+            self.upper[beyond] = 0
+        rows = np.arange(height)[:, None]
+        channel = (rows >= self.upper[None, :]) & (rows < ty)
+        img[channel] = (18, 22, 30)
+        img[ty:ty + 2, :] = (140, 140, 150)                          # flat wall edge highlight
+        self.base = img
 
     def frame(self):
         img = self.base.copy()
-        frac = sim_pressure_bar() / P_MAX
-        x = int((0.15 + 0.7 * (1 - frac)) * self.w)
-        img[:, max(0, x - 3):x + 3] = (255, 80, 80)
+        img += np.random.randint(0, 6, img.shape, dtype=np.uint8)  # sensor noise
+        if SHOCK_X is not None:
+            xs = SHOCK_X(sim_pressure_bar() + P_ATM)
+            if xs is not None:
+                col = int(CAM_THROAT_PX[0] + xs * CAM_PX_PER_MM)
+                if 0 <= col < self.w:
+                    top, bot = self.upper[col], CAM_THROAT_PX[1]
+                    img[top:bot, max(0, col - 1):col + 2] = (235, 235, 235)
         return img
