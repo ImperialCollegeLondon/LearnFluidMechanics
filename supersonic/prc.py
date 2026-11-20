@@ -512,6 +512,10 @@ class VideoThread(QtCore.QThread):
 # -----------------------
 # Video display widget: scales frame to fit, draws pax overlay
 # -----------------------
+def text_width(fm, text):
+    """Pixel width of text: horizontalAdvance on Qt >= 5.11, width() on older Qt (e.g. Raspberry Pi OS)."""
+    return fm.horizontalAdvance(text) if hasattr(fm, "horizontalAdvance") else fm.width(text)
+
 class VideoWidget(QtWidgets.QWidget):
     overlay_changed = QtCore.pyqtSignal()  # position/spacing/scale changed (refreshes sidebar readout)
 
@@ -600,9 +604,14 @@ class VideoWidget(QtWidgets.QWidget):
             self.zoom_at(1.0015 ** dy, e.position())
         e.accept()
 
+    # Trackpad pinch (macOS). Older PyQt5 builds (e.g. Raspberry Pi OS) lack these names, so look
+    # them up safely: an exception in event() would stop the widget painting at all.
+    _NATIVE_GESTURE = getattr(QtCore.QEvent, "NativeGesture", None)
+    _ZOOM_GESTURE = getattr(QtCore.Qt, "ZoomNativeGesture", None)
+
     def event(self, e):
-        # Trackpad pinch (macOS)
-        if e.type() == QtCore.QEvent.NativeGesture and e.gestureType() == QtCore.Qt.ZoomNativeGesture:
+        if (self._NATIVE_GESTURE is not None and e.type() == self._NATIVE_GESTURE
+                and e.gestureType() == self._ZOOM_GESTURE):
             self.zoom_at(1.0 + e.value(), e.localPos())
             return True
         return super().event(e)
@@ -624,16 +633,28 @@ class VideoWidget(QtWidgets.QWidget):
         p.drawImage(visible, self._img, src)  # no smooth transform hint = fast scaling
         self._target = target
 
+        # Each overlay layer is guarded: a bug in one must never blank the video
+        layers = []
         if PAX_OVERLAY and NOZZLE_OUTLINE:
-            self._draw_nozzle(p, target)
+            layers.append(lambda: self._draw_nozzle(p, target))
         if PAX_OVERLAY and self._pax is not None:
-            self._draw_pax_bars(p, target, self._pax)
-            self._draw_theory(p, target)
+            layers.append(lambda: self._draw_pax_bars(p, target, self._pax))
+            layers.append(lambda: self._draw_theory(p, target))
         if PAX_OVERLAY and NOZZLE_OUTLINE:
-            self._draw_shock_markers(p, target)   # last, so bars/curve never hide them
+            layers.append(lambda: self._draw_shock_markers(p, target))   # last, so bars/curve never hide them
         if self.frozen:
-            self._draw_frozen_badge(p)
-        self._draw_status(p)
+            layers.append(lambda: self._draw_frozen_badge(p))
+        layers.append(lambda: self._draw_status(p))
+        for draw in layers:
+            p.save()
+            try:
+                draw()
+            except Exception as e:
+                if not getattr(self, "_paint_err_shown", False):   # report once, not every frame
+                    self._paint_err_shown = True
+                    import traceback; traceback.print_exc()
+                    print(f"Overlay drawing error (video continues): {e}")
+            p.restore()
         p.end()
 
     # --- Overlay drawing ---
@@ -692,7 +713,7 @@ class VideoWidget(QtWidgets.QWidget):
         p.setFont(self._font)
         fm = p.fontMetrics()
         text = (" ● " if msg.startswith("REC") else " ") + msg + " "
-        r = QtCore.QRectF(8, self.height() - fm.height() - 14, min(fm.horizontalAdvance(text) + 8, self.width() - 16), fm.height() + 6)
+        r = QtCore.QRectF(8, self.height() - fm.height() - 14, min(text_width(fm, text) + 8, self.width() - 16), fm.height() + 6)
         p.fillRect(r, QtGui.QColor(183, 28, 28, 220) if (is_error or msg.startswith("REC")) else QtGui.QColor(0, 0, 0, 180))
         p.setPen(QtCore.Qt.white)
         p.drawText(r, QtCore.Qt.AlignVCenter | QtCore.Qt.AlignLeft, text)
@@ -701,7 +722,7 @@ class VideoWidget(QtWidgets.QWidget):
         p.setFont(self._font)
         text = " FROZEN "
         fm = p.fontMetrics()
-        r = QtCore.QRectF(8, 8, fm.horizontalAdvance(text) + 8, fm.height() + 6)
+        r = QtCore.QRectF(8, 8, text_width(fm, text) + 8, fm.height() + 6)
         p.fillRect(r, QtGui.QColor(183, 28, 28, 220))
         p.setPen(QtCore.Qt.white)
         p.drawText(r, QtCore.Qt.AlignCenter, text)
@@ -747,7 +768,7 @@ class VideoWidget(QtWidgets.QWidget):
             fm = p.fontMetrics()
             for v, top in zip(pax, tops):
                 txt = f"{v:.2f}"
-                tx = top.x() - fm.horizontalAdvance(txt) / 2
+                tx = top.x() - text_width(fm, txt) / 2
                 gap = PAX_RING_R + 3
                 ty = top.y() - gap if v >= 0 else top.y() + fm.ascent() + gap  # beyond the end marker
                 p.setPen(self._shadow); p.drawText(QPF(tx + 1, ty + 1), txt)
