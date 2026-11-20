@@ -145,8 +145,7 @@ BIG_POINTER = bool(SAVED.get("big_pointer", BIG_POINTER))
 
 def save_settings():
     """Write all sidebar-tuned values. Called whenever one changes, and on quit."""
-    cfg = {"pax_calibration": [round(v, 4) for v in PAX_CALIBRATION], "big_pointer": BIG_POINTER,
-           "recording": recording}
+    cfg = {"pax_calibration": [round(v, 4) for v in PAX_CALIBRATION], "big_pointer": BIG_POINTER}
     if "video_widget" in globals():
         cfg.update(video_widget.settings_dict())
     try:
@@ -192,12 +191,8 @@ s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 s.settimeout(5)  # fail after 5 seconds instead of hanging indefinitely
 
 tcp = 0 # no need to change this
-recording = 0  # 2 = data & video, 1 = data only, 0 = nothing. Default only: the Record buttons
-               # in the sidebar change it live, and the last choice is remembered.
-try:
-    recording = min(max(int(SAVED.get("recording", recording)), 0), 2)
-except Exception:
-    pass
+recording = 0  # 2 = data & video, 1 = data only, 0 = nothing. Mode at startup; the Record
+               # buttons in the sidebar change it live during the run.
 
 # Track high-precision unrounded variables to prevent dM/dt division-by-zero errors
 last_raw_time = None
@@ -438,6 +433,7 @@ threading.Thread(target=update_data, daemon=True).start()
 # -----------------------
 class VideoThread(QtCore.QThread):
     change_pixmap_signal = QtCore.pyqtSignal(QtGui.QImage)
+    status_signal = QtCore.pyqtSignal(str, bool)   # (message, is_error), shown on the video
 
     def __init__(self, filename):
         super().__init__()
@@ -487,14 +483,17 @@ class VideoThread(QtCore.QThread):
                             if recording_video:
                                 camera.stop_recording()
                                 print("Video recording stopped.")
+                                self.status_signal.emit("", False)
                             else:
                                 n_clips += 1
                                 name = self.filename if n_clips == 1 else self.filename.replace(".h264", f"_{n_clips}.h264")
                                 camera.start_recording(name)
-                                print(f"Video recording to {name}")
+                                print(f"Video recording to {os.path.abspath(name)}")
+                                self.status_signal.emit(f"REC {os.path.basename(name)}", False)
                             recording_video = not recording_video
                         except Exception as e:
                             print(f"Video recording error: {e}")
+                            self.status_signal.emit(f"Video recording error: {e}", True)
 
                     self._emit(frame.array, crop)
                     raw_capture.truncate(0)
@@ -502,7 +501,9 @@ class VideoThread(QtCore.QThread):
                 if recording_video:
                     camera.stop_recording()
         except Exception as e:
+            import traceback; traceback.print_exc()
             print(f"Camera Thread Error: {e}")
+            self.status_signal.emit(f"Camera error: {type(e).__name__}: {e}", True)
 
     def stop(self):
         self._run_flag = False
@@ -610,6 +611,7 @@ class VideoWidget(QtWidgets.QWidget):
         p = QtGui.QPainter(self)
         p.fillRect(self.rect(), QtCore.Qt.black)
         if self._img is None:
+            self._draw_status(p)
             p.end(); return
 
         target = self._view_rect()
@@ -631,6 +633,7 @@ class VideoWidget(QtWidgets.QWidget):
             self._draw_shock_markers(p, target)   # last, so bars/curve never hide them
         if self.frozen:
             self._draw_frozen_badge(p)
+        self._draw_status(p)
         p.end()
 
     # --- Overlay drawing ---
@@ -675,6 +678,24 @@ class VideoWidget(QtWidgets.QWidget):
             p.drawPolygon(QtGui.QPolygonF([tip, QPF(pt.x() - size / 2, tip.y() + d * size),
                                            QPF(pt.x() + size / 2, tip.y() + d * size)]))
         p.setBrush(QtCore.Qt.NoBrush)
+
+    def set_status(self, msg, is_error):
+        self._status = (msg, is_error)
+        self.update()
+
+    def _draw_status(self, p):
+        msg, is_error = getattr(self, "_status", ("", False))
+        if self._img is None and not msg:
+            msg = "Waiting for camera frames..."
+        if not msg:
+            return
+        p.setFont(self._font)
+        fm = p.fontMetrics()
+        text = (" ● " if msg.startswith("REC") else " ") + msg + " "
+        r = QtCore.QRectF(8, self.height() - fm.height() - 14, min(fm.horizontalAdvance(text) + 8, self.width() - 16), fm.height() + 6)
+        p.fillRect(r, QtGui.QColor(183, 28, 28, 220) if (is_error or msg.startswith("REC")) else QtGui.QColor(0, 0, 0, 180))
+        p.setPen(QtCore.Qt.white)
+        p.drawText(r, QtCore.Qt.AlignVCenter | QtCore.Qt.AlignLeft, text)
 
     def _draw_frozen_badge(self, p):
         p.setFont(self._font)
@@ -1041,7 +1062,6 @@ def set_recording(mode):
     recording = mode
     record_group.button(mode).setChecked(True)
     print(["Recording off", f"Recording data -> {csv_filename}", f"Recording data + video -> {csv_filename}, {video_filename}"][mode])
-    save_settings()
 
 record_group.buttonClicked.connect(lambda b: set_recording(record_group.id(b)))
 recording = 1 if (recording == 2 and not HAVE_CAM) else recording
@@ -1066,6 +1086,7 @@ p_mdot = win.addPlot(title="Mass Flow Rate (g/s)"); cur_mdot = p_mdot.plot(pen='
 
 vid_thread = VideoThread(video_filename)
 vid_thread.change_pixmap_signal.connect(video_widget.set_frame)
+vid_thread.status_signal.connect(video_widget.set_status)
 vid_thread.start()
 
 last_jump_time = 0
