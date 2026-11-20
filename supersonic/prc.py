@@ -50,9 +50,15 @@ from datetime import datetime
 import json
 import os
 
-# Calibration of Kulite sensors (bar, added to each Pax reading). These are defaults:
-# edit live in the sidebar "Kulite calibration" box; changes are saved to SETTINGS_FILE.
-PAX_CALIBRATION = [0.23, 0.23, 0.23, 0.23]
+# Kulite calibration. LabVIEW sends a raw reading per sensor that is linear in pressure and ~0 at
+# atmospheric (gauge). Converted to absolute bar as:  p = (raw - PAX_ZERO) / PAX_SENS + P_atm
+#   PAX_ZERO: raw reading with no flow (taps at atmospheric). "Zero now" in the sidebar sets it.
+#   PAX_SENS: raw units per bar. Fitted to the 20 Nov 2026 snapshots (taps upstream of the shock vs
+#   isentropic theory with P0 = P2, nozzle GEN_M2p4): ~7.1 overall; Pax4 rests on a single point.
+#   Replace with the Kulite calibration sheets (SN 107, 110, 112, 113) if you find them.
+# These are defaults: edit live in the sidebar "Kulite calibration" box; changes are saved to SETTINGS_FILE.
+PAX_ZERO = [0.0, 0.0, 0.0, 0.0]
+PAX_SENS = [7.67, 6.68, 7.17, 7.49]
 
 # -----------------------
 # Video & Overlay Settings (edit here)
@@ -110,12 +116,13 @@ SHOCK_MARKER_COLOR = "#FF1744"
 # flow at the measured P0. Taps agree while the flow is shock-free there, then depart one by one
 # as the shock moves upstream past them.
 PAX_SHOW_ISENTROPIC = True
-PAX_ABSOLUTE = True              # True: Pax values are absolute bar (as the original analysis assumed); False: gauge
 ISEN_COLOR = "#FFEA00"
 
 # Nozzle geometry (shared by the shock solver, nozzle plot and theory reference).
-# Profiles and tap positions are in nozzle_theory.py. GEN_M2p74: A/A* = 3.33, Pax1 at the throat, taps 6 mm apart.
-NOZZLE_PROFILE = "GEN_M2p74"
+# Profiles and tap positions are in nozzle_theory.py. Must match the nozzle block fitted:
+#   GEN_M2p4:  A/A* = 2.42, taps at 6/12/18/24 mm from the throat (the block labelled "GEN M2.4")
+#   GEN_M2p74: A/A* = 3.33, taps at 0/6/12/18 mm (old profile per the rig instructions)
+NOZZLE_PROFILE = "GEN_M2p4"
 NOZZLE_WIDTH_M = 0.008           # constant channel width (design spreadsheet)
 # Transducers: P1/T1 = supply tank (gives tank mass and mass flow), P2/T2 = plenum just upstream
 # of the nozzle. The nozzle stagnation pressure P0 is the plenum, so "p2".
@@ -137,15 +144,18 @@ def load_saved_settings():
 
 SAVED = load_saved_settings()
 try:
-    if "pax_calibration" in SAVED:
-        PAX_CALIBRATION = [float(v) for v in SAVED["pax_calibration"]][:4]
+    if "pax_zero" in SAVED:
+        PAX_ZERO = [float(v) for v in SAVED["pax_zero"]][:4]
+    if "pax_sens" in SAVED:
+        PAX_SENS = [float(v) for v in SAVED["pax_sens"]][:4]
 except Exception as e:
     print(f"Ignoring saved calibration ({e})")
 BIG_POINTER = bool(SAVED.get("big_pointer", BIG_POINTER))
 
 def save_settings():
     """Write all sidebar-tuned values. Called whenever one changes, and on quit."""
-    cfg = {"pax_calibration": [round(v, 4) for v in PAX_CALIBRATION], "big_pointer": BIG_POINTER}
+    cfg = {"pax_zero": [round(v, 4) for v in PAX_ZERO], "pax_sens": [round(v, 4) for v in PAX_SENS],
+           "big_pointer": BIG_POINTER}
     if "video_widget" in globals():
         cfg.update(video_widget.settings_dict())
     try:
@@ -235,12 +245,14 @@ data = {
     'A_NS': deque(maxlen=buffer_size),
     'pax1': deque(maxlen=buffer_size), 'pax2': deque(maxlen=buffer_size),
     'pax3': deque(maxlen=buffer_size), 'pax4': deque(maxlen=buffer_size),
+    **{f'pax{i}_bar': deque(maxlen=buffer_size) for i in range(1, 5)},   # calibrated, absolute bar
 }
 
 # Unbounded storage repository to safely capture full run history for CSV export
 csv_history = {
     'time': [], 'p1': [], 'p2': [], 't1': [], 't2': [], 'm': [], 'mdot': [],
-    'M1': [], 'M2': [], 'A_NS': [], 'pax1': [], 'pax2': [], 'pax3': [], 'pax4': []
+    'M1': [], 'M2': [], 'A_NS': [], 'pax1': [], 'pax2': [], 'pax3': [], 'pax4': [],
+    'pax1_bar': [], 'pax2_bar': [], 'pax3_bar': [], 'pax4_bar': [],   # raw paxN kept for re-calibration later
 }
 
 start_time = time.time()
@@ -320,18 +332,20 @@ filtmdot_adaptive = AdaptiveFilter(alpha_min=0.01, alpha_max=0.04, sensitivity=0
 
 NOZZLE = nozzle_theory.Nozzle(NOZZLE_PROFILE)
 NOZZLE_AT = NOZZLE.h_throat / 1000 * NOZZLE_WIDTH_M   # m^2 (48 mm^2)
-NOZZLE_AE = NOZZLE_AT * NOZZLE.ae_at                   # m^2 (160 mm^2 for GEN_M2p74)
+NOZZLE_AE = NOZZLE_AT * NOZZLE.ae_at                   # m^2
 solve_nozzle_shock = nozzle_theory.solve_nozzle_shock
 
-def tap_theory_bar(p0_abs_bar):
-    """Theoretical static pressure at each Pax tap, in the same units as the Pax readings."""
-    p_atm = P_ATM_PA / 1e5
-    p = nozzle_theory.wall_pressure(NOZZLE, NOZZLE.taps_mm, p0_abs_bar, p_atm)
-    return p if PAX_ABSOLUTE else [v - p_atm for v in p]
+def pax_to_bar(i, raw):
+    """Raw Kulite reading (as sent by LabVIEW) -> absolute bar."""
+    return (raw - PAX_ZERO[i]) / PAX_SENS[i] + P_ATM_PA / 1e5
 
-# In --sim, fake Pax readings follow the same theory (minus the calibration that update() adds back),
-# so the bars should sit on the theory ticks.
-sim_hardware.PAX_MODEL = lambda p0_abs_bar: [v - c for v, c in zip(tap_theory_bar(p0_abs_bar), PAX_CALIBRATION)]
+def tap_theory_bar(p0_abs_bar):
+    """Theoretical static pressure (absolute bar) at each Pax tap, shock included."""
+    return nozzle_theory.wall_pressure(NOZZLE, NOZZLE.taps_mm, p0_abs_bar, P_ATM_PA / 1e5)
+
+# In --sim, fake raw Kulite readings follow the theory, in LabVIEW's raw units (the inverse of pax_to_bar)
+sim_hardware.PAX_MODEL = lambda p0_abs_bar: [(v - P_ATM_PA / 1e5) * PAX_SENS[i] + PAX_ZERO[i]
+                                             for i, v in enumerate(tap_theory_bar(p0_abs_bar))]
 # Fake camera draws this nozzle with the shock at its theoretical position
 sim_hardware.NOZZLE = NOZZLE
 sim_hardware.SHOCK_X = lambda p0_abs_bar: nozzle_theory.shock_x(NOZZLE, p0_abs_bar, P_ATM_PA / 1e5)
@@ -416,7 +430,8 @@ def update_data():
         last_raw_mass = m_curr
         
         # Raw value collection array (Rounding removed completely - MODIFIED)
-        raw_values = [raw_now, p01/100000, p02/100000, t1, t2, m_curr, mdot_val, m1, m2, A_NS, pax1, pax2, pax3, pax4]
+        pax_bar = [pax_to_bar(i, v) for i, v in enumerate((pax1, pax2, pax3, pax4))]
+        raw_values = [raw_now, p01/100000, p02/100000, t1, t2, m_curr, mdot_val, m1, m2, A_NS, pax1, pax2, pax3, pax4] + pax_bar
         
         # Stream raw full-precision metrics directly into both deques and history logs (MODIFIED)
         with data_lock:
@@ -781,7 +796,7 @@ class VideoWidget(QtWidgets.QWidget):
             return
         QPF = QtCore.QPointF
         _, y0, px_per_bar = self._geometry(target, 1)
-        offset = 0.0 if PAX_ABSOLUTE else P_ATM_PA / 1e5
+        offset = 0.0
         pts = [QPF(self._mm_to_screen(target, x, 0).x(), y0 - (self._p0 * r - offset) * px_per_bar)
                for x, r in zip(self._isen_x, self._isen_ratio)]
         isen = QtGui.QColor(ISEN_COLOR)
@@ -973,25 +988,44 @@ def create_lcd(label_text, color):
     return container, lcd
 
 def make_calibration_controls():
-    """Sidebar box with one spin box per Kulite offset; edits apply live and are saved."""
-    box = QtWidgets.QGroupBox("Kulite calibration (bar offset)")
+    """Sidebar box: per Kulite, the raw reading at zero flow and the sensitivity (raw units per bar).
+    Edits apply live (to the display and the *_bar CSV columns) and are saved."""
+    box = QtWidgets.QGroupBox("Kulite calibration")
     box.setStyleSheet(
         "QGroupBox { color: #00B0FF; font-weight: bold; border: 1px solid #333; margin-top: 8px; padding-top: 6px; }"
         "QGroupBox::title { subcontrol-origin: margin; left: 6px; }"
         "QLabel { color: #BBB; }"
-        "QDoubleSpinBox { background: #222; color: white; border: 1px solid #444; padding: 2px; }")
+        "QDoubleSpinBox { background: #222; color: white; border: 1px solid #444; padding: 2px; }"
+        "QPushButton { background: #333; color: white; border: 1px solid #555; padding: 4px; }")
     g = QtWidgets.QGridLayout(box)
+    g.addWidget(QtWidgets.QLabel("zero (raw)"), 0, 1)
+    g.addWidget(QtWidgets.QLabel("per bar"), 0, 2)
+    zero_boxes = []
     for i in range(4):
-        sb = QtWidgets.QDoubleSpinBox()
-        sb.setRange(-5.0, 5.0); sb.setDecimals(3); sb.setSingleStep(0.01)
-        sb.setValue(PAX_CALIBRATION[i])
-        sb.setKeyboardTracking(False)  # apply when Enter pressed / focus leaves, not on every keystroke
-        def on_change(v, i=i):
-            PAX_CALIBRATION[i] = v
-            save_settings()
-        sb.valueChanged.connect(on_change)
-        g.addWidget(QtWidgets.QLabel(f"Pax{i+1}"), i // 2, (i % 2) * 2)
-        g.addWidget(sb, i // 2, (i % 2) * 2 + 1)
+        for col, (store, lo, hi, step) in enumerate(((PAX_ZERO, -50.0, 50.0, 0.01), (PAX_SENS, 0.01, 1000.0, 0.05))):
+            sb = QtWidgets.QDoubleSpinBox()
+            sb.setRange(lo, hi); sb.setDecimals(3); sb.setSingleStep(step)
+            sb.setValue(store[i])
+            sb.setKeyboardTracking(False)  # apply when Enter pressed / focus leaves, not on every keystroke
+            def on_change(v, i=i, store=store):
+                store[i] = v
+                save_settings()
+            sb.valueChanged.connect(on_change)
+            g.addWidget(sb, i + 1, col + 1)
+            if store is PAX_ZERO: zero_boxes.append(sb)
+        g.addWidget(QtWidgets.QLabel(f"Pax{i+1}"), i + 1, 0)
+    zero_btn = QtWidgets.QPushButton("Zero now (no flow)")
+    zero_btn.setToolTip("With the valve shut (taps at atmospheric), take the current raw readings\n"
+                        "(averaged over the last second) as each sensor's zero.")
+    def zero_now():
+        with data_lock:
+            n = min(len(data['time']), int(1.0 / sample_interval))
+            if n == 0: return
+            means = [float(np.mean(list(data[f'pax{i+1}'])[-n:])) for i in range(4)]
+        for sb, m in zip(zero_boxes, means):
+            sb.setValue(m)   # valueChanged stores and saves
+    zero_btn.clicked.connect(zero_now)
+    g.addWidget(zero_btn, 5, 0, 1, 3)
     return box
 
 # Sidebar content scrolls; the Quit button stays pinned below it
@@ -1128,7 +1162,7 @@ def update():
     cur_p1.setData(t_arr, snap['p1']); cur_p2.setData(t_arr, snap['p2'])
     cur_mdot.setData(t_arr, snap['mdot'])
     
-    pax_cal = [snap[f'pax{i+1}'][-1] + PAX_CALIBRATION[i] for i in range(4)]
+    pax_cal = [snap[f'pax{i+1}_bar'][-1] for i in range(4)]
     # Theoretical tap pressures and shock position from the measured stagnation pressure (absolute bar)
     ans, m1_val = snap['A_NS'][-1], snap['M1'][-1]
     ar_shock = ans / NOZZLE_AT
@@ -1138,7 +1172,7 @@ def update():
     video_widget.set_pax(pax_cal, snap[P0_CHANNEL][-1], x_shock)
     latest_values.clear()
     latest_values.update({k: float(snap[k][-1]) for k in snap})
-    latest_values.update({f"pax{i+1}_calibrated": float(v) for i, v in enumerate(pax_cal)})
+    latest_values["pax_zero"], latest_values["pax_sens"] = list(PAX_ZERO), list(PAX_SENS)
     latest_values["shock_x_mm_theory"] = None if x_shock is None else float(x_shock)
     latest_values["csv_file"] = csv_filename if recording >= 1 else None
 
