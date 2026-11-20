@@ -18,14 +18,15 @@ import numpy as np
 
 CYCLE = 30.0   # s, length of one simulated run before the tank "refills"
 HOLD = 3.0     # s at full pressure before blowdown starts
-P_MAX = 5.0    # bar gauge at start of blowdown
+P_MAX = 6.0    # bar gauge in the supply tank at start of blowdown
+PLENUM_FRAC = 0.85  # plenum (nozzle P0) gauge pressure as a fraction of tank: valve/pipe losses
 TAU = 6.0      # s, blowdown time constant
 
 _t0 = time.time()
 
 
 def sim_pressure_bar():
-    """Tank gauge pressure (bar) at the current moment of the scenario."""
+    """Supply tank gauge pressure (bar) at the current moment of the scenario."""
     t = (time.time() - _t0) % CYCLE
     if t < HOLD:
         return P_MAX
@@ -36,8 +37,10 @@ class FakeADC:
     """ADS1115 replacement. Returns counts that prc.py's conversion maps back to sim pressure."""
 
     def read_adc(self, channel, gain=1.0):
-        # ch0 = P1 upstream reservoir; ch1 = P2 downstream plenum (only slightly above atm)
-        p = sim_pressure_bar() * (1.0 if channel == 0 else 0.03) + random.gauss(0, 0.01)
+        # ch0 = P1 supply tank; ch1 = P2 plenum feeding the nozzle
+        p = sim_pressure_bar() * (1.0 if channel == 0 else PLENUM_FRAC) + random.gauss(0, 0.01)
+        if channel == 1:
+            p -= 0.05  # prc.py adds a 0.05 bar offset to P2
         # Invert prc.py: p = (counts/32767*6.144*50 - 25) * 0.0689 * 0.75
         counts = (p / (0.0689 * 0.75) + 25) / (50 * 6.144) * 32767
         return int(max(-32768, min(32767, counts)))
@@ -57,6 +60,11 @@ class FakeThermocouple:
 
 P_ATM = 1.01625
 
+def plenum_abs_bar():
+    """Plenum (nozzle stagnation) absolute pressure, bar."""
+    return sim_pressure_bar() * PLENUM_FRAC + P_ATM
+
+
 # prc.py sets this to a function p0_abs_bar -> 4 Pax readings from nozzle theory,
 # so simulated taps show isentropic expansion and a shock moving through as the tank empties.
 PAX_MODEL = None
@@ -64,7 +72,7 @@ PAX_MODEL = None
 
 def fake_pax():
     """Four nozzle-wall pressures, as LabVIEW would send them."""
-    p0 = sim_pressure_bar() + P_ATM  # absolute stagnation pressure
+    p0 = plenum_abs_bar()  # nozzle stagnation pressure
     if PAX_MODEL is not None:
         base = PAX_MODEL(p0)
     else:  # crude fallback: falling pressures along the nozzle
@@ -106,7 +114,7 @@ class FakeCamera:
         img = self.base.copy()
         img += np.random.randint(0, 6, img.shape, dtype=np.uint8)  # sensor noise
         if SHOCK_X is not None:
-            xs = SHOCK_X(sim_pressure_bar() + P_ATM)
+            xs = SHOCK_X(plenum_abs_bar())
             if xs is not None:
                 col = int(CAM_THROAT_PX[0] + xs * CAM_PX_PER_MM)
                 if 0 <= col < self.w:

@@ -2,18 +2,19 @@
   "pax_calibration": [
     0.23,
     0.23,
-    0.08,
+    0.23,
     0.23
   ],
+  "big_pointer": true,
   "pax1_pos": [
-    0.1719,
+    0.1919,
     0.375
   ],
-  "spacing": 0.0656,
-  "bar_scale": 0.0909,
-  "zoom": 1.8492,
+  "spacing": 0.0606,
+  "bar_scale": 0.1331,
+  "zoom": 1.6329,
   "view_center": [
-    0.4729,
-    0.3583
+    0.3604,
+    0.3536
   ]
 }

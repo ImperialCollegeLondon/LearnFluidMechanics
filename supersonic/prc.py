@@ -86,6 +86,12 @@ PAX_RING_R = 7                   # px, thin ring around the dot
 PAX_STEP = 0.005                 # change per click / arrow key (Shift = x5)
 OVERLAY_FONT_PT = 9
 OVERLAY_COLOR = "#00E5FF"
+# Freeze (button or Space/F) pauses the display only: data logging and video recording carry on.
+# Each snapshot = window screenshot + raw video frame + the values on screen, in SNAPSHOT_DIR.
+SNAPSHOT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "snapshots")
+SNAPSHOT_ON_FREEZE = True        # save a snapshot automatically every time you freeze
+BIG_POINTER = False              # large presenter mouse pointer (toggle in the sidebar or P; remembered)
+BIG_POINTER_SIZE = 56            # px, arrow height
 # Values tuned in the sidebar (overlay position/spacing/scale, Kulite calibration) are saved here
 # and reloaded on start, overriding the defaults in this file. Delete the file to go back to defaults.
 # The simulated camera gets its own file so tuning in --sim never disturbs the real alignment.
@@ -111,9 +117,9 @@ ISEN_COLOR = "#FFEA00"
 # Profiles and tap positions are in nozzle_theory.py. GEN_M2p74: A/A* = 3.33, Pax1 at the throat, taps 6 mm apart.
 NOZZLE_PROFILE = "GEN_M2p74"
 NOZZLE_WIDTH_M = 0.008           # constant channel width (design spreadsheet)
-# Which plenum transducer is the nozzle stagnation pressure P0: "p1" = upstream reservoir.
-# (The original code used "p2" here; P2 is the downstream plenum.)
-P0_CHANNEL = "p1"
+# Transducers: P1/T1 = supply tank (gives tank mass and mass flow), P2/T2 = plenum just upstream
+# of the nozzle. The nozzle stagnation pressure P0 is the plenum, so "p2".
+P0_CHANNEL = "p2"
 P_ATM_PA = 101625.0
 
 # --- Load values saved from the sidebar on a previous run ---
@@ -135,10 +141,12 @@ try:
         PAX_CALIBRATION = [float(v) for v in SAVED["pax_calibration"]][:4]
 except Exception as e:
     print(f"Ignoring saved calibration ({e})")
+BIG_POINTER = bool(SAVED.get("big_pointer", BIG_POINTER))
 
 def save_settings():
     """Write all sidebar-tuned values. Called whenever one changes, and on quit."""
-    cfg = {"pax_calibration": [round(v, 4) for v in PAX_CALIBRATION]}
+    cfg = {"pax_calibration": [round(v, 4) for v in PAX_CALIBRATION], "big_pointer": BIG_POINTER,
+           "recording": recording}
     if "video_widget" in globals():
         cfg.update(video_widget.settings_dict())
     try:
@@ -184,7 +192,12 @@ s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 s.settimeout(5)  # fail after 5 seconds instead of hanging indefinitely
 
 tcp = 0 # no need to change this
-recording = 0  # 2 = data & video, 1 = data only, 0 = nothing
+recording = 0  # 2 = data & video, 1 = data only, 0 = nothing. Default only: the Record buttons
+               # in the sidebar change it live, and the last choice is remembered.
+try:
+    recording = min(max(int(SAVED.get("recording", recording)), 0), 2)
+except Exception:
+    pass
 
 # Track high-precision unrounded variables to prevent dM/dt division-by-zero errors
 last_raw_time = None
@@ -245,7 +258,7 @@ video_filename = f"video_{timestamp_str}{sim_tag}.h264"
 # --- Export Routine on Close ---
 def save_data_to_csv():
     if recording < 1:
-        print("Recording mode disabled (0) — skipping CSV telemetry export.")
+        print("Recording off — skipping CSV telemetry export.")
         return
         
     print(f"Saving complete telemetry history to {csv_filename}...")
@@ -457,8 +470,8 @@ class VideoThread(QtCore.QThread):
                 camera.framerate = CAMERA_FRAMERATE
                 camera.exposure_compensation = -20
 
-                if recording == 2:
-                    camera.start_recording(self.filename)
+                recording_video = False
+                n_clips = 0
 
                 raw_capture = PiRGBArray(camera, size=CAMERA_RESOLUTION)
                 crop = QtCore.QRect(*VIDEO_CROP) if VIDEO_CROP else None
@@ -468,10 +481,25 @@ class VideoThread(QtCore.QThread):
                     if not self._run_flag:
                         break
 
+                    # Follow the Record setting live; each start gets its own file
+                    if (recording == 2) != recording_video:
+                        try:
+                            if recording_video:
+                                camera.stop_recording()
+                                print("Video recording stopped.")
+                            else:
+                                n_clips += 1
+                                name = self.filename if n_clips == 1 else self.filename.replace(".h264", f"_{n_clips}.h264")
+                                camera.start_recording(name)
+                                print(f"Video recording to {name}")
+                            recording_video = not recording_video
+                        except Exception as e:
+                            print(f"Video recording error: {e}")
+
                     self._emit(frame.array, crop)
                     raw_capture.truncate(0)
-                
-                if recording == 2:
+
+                if recording_video:
                     camera.stop_recording()
         except Exception as e:
             print(f"Camera Thread Error: {e}")
@@ -499,6 +527,7 @@ class VideoWidget(QtWidgets.QWidget):
         self._isen_ratio = [nozzle_theory.p_isen(nozzle_theory.solve_mach(NOZZLE.area_ratio(x), True))
                             for x in self._isen_x]
         self._target = None    # where the frame was last drawn (for mouse hit-testing)
+        self.frozen = False    # True: ignore new frames/values (overlay tuning and zoom still work)
         self._drag = None      # (mode, start mouse pos, start value(s)) while dragging
         self._font = QtGui.QFontDatabase.systemFont(QtGui.QFontDatabase.FixedFont)  # monospace on any OS
         self._font.setPointSize(OVERLAY_FONT_PT)
@@ -522,6 +551,8 @@ class VideoWidget(QtWidgets.QWidget):
         self.setAttribute(QtCore.Qt.WA_OpaquePaintEvent)  # skip background erase
 
     def set_frame(self, img):
+        if self.frozen:
+            return
         self._img = img
         self.update()  # repaint once per camera frame
 
@@ -598,6 +629,8 @@ class VideoWidget(QtWidgets.QWidget):
             self._draw_theory(p, target)
         if PAX_OVERLAY and NOZZLE_OUTLINE:
             self._draw_shock_markers(p, target)   # last, so bars/curve never hide them
+        if self.frozen:
+            self._draw_frozen_badge(p)
         p.end()
 
     # --- Overlay drawing ---
@@ -642,6 +675,15 @@ class VideoWidget(QtWidgets.QWidget):
             p.drawPolygon(QtGui.QPolygonF([tip, QPF(pt.x() - size / 2, tip.y() + d * size),
                                            QPF(pt.x() + size / 2, tip.y() + d * size)]))
         p.setBrush(QtCore.Qt.NoBrush)
+
+    def _draw_frozen_badge(self, p):
+        p.setFont(self._font)
+        text = " FROZEN "
+        fm = p.fontMetrics()
+        r = QtCore.QRectF(8, 8, fm.horizontalAdvance(text) + 8, fm.height() + 6)
+        p.fillRect(r, QtGui.QColor(183, 28, 28, 220))
+        p.setPen(QtCore.Qt.white)
+        p.drawText(r, QtCore.Qt.AlignCenter, text)
 
     def _geometry(self, target, n):
         """Screen x of each tap, the zero-pressure baseline y, and pixels per bar."""
@@ -929,8 +971,8 @@ if simulated:
     sim_banner.setWordWrap(True)
     sim_banner.setStyleSheet("background-color: #B71C1C; color: white; font-weight: bold; font-size: 14px; padding: 6px;")
     right_panel.addWidget(sim_banner)
-c_p1, l_p1 = create_lcd("P1 (bar)", "#00E5FF"); c_p2, l_p2 = create_lcd("P2 (bar)", "#FF3D00")
-c_t1, l_t1 = create_lcd("T1 (°C)", "#00E676"); c_t2, l_t2 = create_lcd("T2 (°C)", "#FFEA00")
+c_p1, l_p1 = create_lcd("P1 tank (bar)", "#00E5FF"); c_p2, l_p2 = create_lcd("P2 plenum (bar)", "#FF3D00")
+c_t1, l_t1 = create_lcd("T1 tank (°C)", "#00E676"); c_t2, l_t2 = create_lcd("T2 plenum (°C)", "#FFEA00")
 c_mass, l_mass = create_lcd("Mass (kg)", "#BA68C8"); c_md, l_md = create_lcd("Mdot (g/s)", "#FF1744")
 c_m1, l_m1 = create_lcd("M1 (Shock)", "#D1C4E9"); c_m2, l_m2 = create_lcd("M2 (Post)", "#B39DDB")
 c_pax1, l_pax1 = create_lcd("Pax1 (bar)", "#00B0FF"); c_pax2, l_pax2 = create_lcd("Pax2 (bar)", "#00B0FF")
@@ -951,7 +993,68 @@ quit_btn.setToolTip("Stop camera, save data and exit (Ctrl+Q / ⌘Q)")
 quit_btn.setStyleSheet("QPushButton { background: #B71C1C; color: white; font-weight: bold; font-size: 14px; padding: 8px; border: none; }"
                        "QPushButton:pressed { background: #7F0000; }")
 quit_btn.clicked.connect(app.quit)
-right_col_layout.addWidget(quit_btn)
+
+def _btn_style(bg, pressed):
+    return (f"QPushButton {{ background: {bg}; color: white; font-weight: bold; font-size: 14px; padding: 8px; border: none; }}"
+            f"QPushButton:pressed {{ background: {pressed}; }}")
+
+freeze_btn = QtWidgets.QPushButton("Freeze")
+freeze_btn.setToolTip("Freeze the display (Space or F). Data logging and recording continue."
+                      + (" A snapshot is saved on each freeze." if SNAPSHOT_ON_FREEZE else ""))
+freeze_btn.setFocusPolicy(QtCore.Qt.NoFocus)   # so Space never 'clicks' a focused button twice
+save_btn = QtWidgets.QPushButton("Save")
+save_btn.setToolTip(f"Save a snapshot (S): screenshot, raw video frame and values, into {SNAPSHOT_DIR}")
+save_btn.setStyleSheet(_btn_style("#1565C0", "#0D47A1"))
+save_btn.setFocusPolicy(QtCore.Qt.NoFocus)
+pointer_btn = QtWidgets.QPushButton("Pointer")
+pointer_btn.setToolTip("Large mouse pointer for presenting (P)")
+pointer_btn.setCheckable(True)
+pointer_btn.setFocusPolicy(QtCore.Qt.NoFocus)
+pointer_btn.setStyleSheet(_btn_style("#424242", "#212121") +
+                          "QPushButton:checked { background: #F9A825; color: black; }")
+
+# Record mode: Off / Data / Data+Video. Data = the whole run's CSV, written on quit
+# (the full history is always kept, so switching Data on late still saves everything).
+record_row = QtWidgets.QHBoxLayout(); record_row.setSpacing(0); record_row.setContentsMargins(4, 4, 4, 0)
+record_lbl = QtWidgets.QLabel("Record"); record_lbl.setStyleSheet("color: #BBB; font-weight: bold; padding-right: 6px;")
+record_row.addWidget(record_lbl)
+record_group = QtWidgets.QButtonGroup(right_col); record_group.setExclusive(True)
+for mode, text, tip in ((0, "Off", "Nothing saved"),
+                        (1, "Data", f"Save the full run's data to {csv_filename} on quit"),
+                        (2, "Data+Video", "Data, plus the camera's own video (no overlay) to video_*.h264"
+                                          + ("" if HAVE_CAM else ". Not available with the simulated camera."))):
+    b = QtWidgets.QPushButton(text); b.setCheckable(True); b.setToolTip(tip)
+    b.setFocusPolicy(QtCore.Qt.NoFocus)
+    b.setStyleSheet("QPushButton { background: #263238; color: #BBB; padding: 5px 8px; border: 1px solid #444; }"
+                    "QPushButton:checked { background: %s; color: white; font-weight: bold; }"
+                    "QPushButton:disabled { color: #555; }" % ("#455A64" if mode == 0 else "#C62828"))
+    if mode == 2 and not HAVE_CAM:
+        b.setEnabled(False)
+    record_group.addButton(b, mode); record_row.addWidget(b)
+record_row.addStretch()
+right_col_layout.addLayout(record_row)
+
+def set_recording(mode):
+    global recording
+    if mode == 2 and not HAVE_CAM:
+        mode = 1
+    recording = mode
+    record_group.button(mode).setChecked(True)
+    print(["Recording off", f"Recording data -> {csv_filename}", f"Recording data + video -> {csv_filename}, {video_filename}"][mode])
+    save_settings()
+
+record_group.buttonClicked.connect(lambda b: set_recording(record_group.id(b)))
+recording = 1 if (recording == 2 and not HAVE_CAM) else recording
+record_group.button(recording).setChecked(True)
+
+button_row = QtWidgets.QHBoxLayout(); button_row.setSpacing(4)
+for b in (freeze_btn, save_btn, pointer_btn, quit_btn):
+    button_row.addWidget(b)
+right_col_layout.addLayout(button_row)
+snapshot_status = QtWidgets.QLabel("")
+snapshot_status.setStyleSheet("color: #888; font-size: 11px; padding: 2px 4px;")
+snapshot_status.setWordWrap(True)
+right_col_layout.addWidget(snapshot_status)
 quit_sc = QtWidgets.QShortcut(QtGui.QKeySequence(QtGui.QKeySequence.Quit), main_widget)
 quit_sc.setContext(QtCore.Qt.ApplicationShortcut)
 quit_sc.activated.connect(app.quit)
@@ -968,6 +1071,8 @@ vid_thread.start()
 last_jump_time = 0
 def update():
     global last_jump_time
+    if video_widget.frozen:
+        return   # display frozen; the data thread keeps logging
     # Snapshot under the lock so every series has the same length (data thread appends concurrently)
     with data_lock:
         if not data['time']: return
@@ -989,10 +1094,89 @@ def update():
     if m1_val > 1.01 and 1.001 < ar_shock < NOZZLE.ae_at - 1e-4:
         x_shock = NOZZLE.x_at_area_ratio(ar_shock)
     video_widget.set_pax(pax_cal, snap[P0_CHANNEL][-1], x_shock)
+    latest_values.clear()
+    latest_values.update({k: float(snap[k][-1]) for k in snap})
+    latest_values.update({f"pax{i+1}_calibrated": float(v) for i, v in enumerate(pax_cal)})
+    latest_values["shock_x_mm_theory"] = None if x_shock is None else float(x_shock)
+    latest_values["csv_file"] = csv_filename if recording >= 1 else None
 
     for l, d in zip([l_p1, l_p2, l_t1, l_t2, l_mass, l_md, l_m1, l_m2, l_pax1, l_pax2, l_pax3, l_pax4],
                     [snap['p1'][-1], snap['p2'][-1], snap['t1'][-1], snap['t2'][-1], snap['m'][-1]/1000, snap['mdot'][-1], snap['M1'][-1], snap['M2'][-1]] + pax_cal):
         l.display(f"{d:.2f}" if l != l_mass else f"{d:.3f}")
+
+# --- Freeze, snapshots, presenter pointer ---
+latest_values = {}   # what's on screen now (filled by update()), written into snapshot files
+
+def save_snapshot():
+    """Window screenshot + raw (cropped/flipped) video frame + on-screen values, timestamped."""
+    try:
+        os.makedirs(SNAPSHOT_DIR, exist_ok=True)
+        base = os.path.join(SNAPSHOT_DIR, f"snap_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')[:-3]}{sim_tag}")
+        main_widget.grab().save(base + ".png")
+        if video_widget._img is not None:
+            video_widget._img.save(base + "_video.png")
+        with open(base + ".json", "w") as f:
+            json.dump(latest_values, f, indent=2)
+        snapshot_status.setText(f"Saved {os.path.basename(base)}")
+        print(f"Snapshot saved: {base}.png / _video.png / .json")
+    except Exception as e:
+        snapshot_status.setText(f"Snapshot failed: {e}")
+        print(f"Snapshot failed: {e}")
+
+def set_frozen(on):
+    video_widget.frozen = on
+    freeze_btn.setText("Unfreeze" if on else "Freeze")
+    freeze_btn.setStyleSheet(_btn_style("#2E7D32", "#1B5E20") if on else _btn_style("#455A64", "#263238"))
+    video_widget.update()
+    if on and SNAPSHOT_ON_FREEZE:
+        QtCore.QTimer.singleShot(0, save_snapshot)  # after the FROZEN state has been painted
+
+def _make_big_cursor(size):
+    """White arrow with black outline and a yellow halo round the tip, drawn at 2x for Retina."""
+    dpr = 2.0
+    halo = size * 0.35
+    w = int((size * 0.75 + halo) * dpr) + 4
+    h = int((size + halo) * dpr) + 4
+    pm = QtGui.QPixmap(w, h); pm.fill(QtCore.Qt.transparent)
+    p = QtGui.QPainter(pm); p.setRenderHint(QtGui.QPainter.Antialiasing)
+    p.scale(dpr, dpr)
+    tip = QtCore.QPointF(halo, halo)
+    p.setPen(QtCore.Qt.NoPen); p.setBrush(QtGui.QColor(255, 234, 0, 90))
+    p.drawEllipse(tip, halo, halo)
+    s = size / 16.0   # classic arrow outline on a 16-unit grid
+    pts = [(0, 0), (0, 15), (4, 11.5), (6.8, 17), (9, 16), (6.3, 10.6), (11, 10.6)]
+    poly = QtGui.QPolygonF([QtCore.QPointF(tip.x() + x * s * 0.95, tip.y() + y * s * 0.95) for x, y in pts])
+    pen = QtGui.QPen(QtCore.Qt.black, max(1.5, size / 22)); pen.setJoinStyle(QtCore.Qt.RoundJoin)
+    p.setPen(pen); p.setBrush(QtCore.Qt.white)
+    p.drawPolygon(poly)
+    p.end()
+    pm.setDevicePixelRatio(dpr)
+    return QtGui.QCursor(pm, int(tip.x()), int(tip.y()))
+
+BIG_CURSOR = _make_big_cursor(BIG_POINTER_SIZE)
+
+def set_big_pointer(on):
+    global BIG_POINTER
+    BIG_POINTER = on
+    pointer_btn.setChecked(on)
+    # Set on the window: widgets without their own cursor inherit it (drag handles keep theirs)
+    if on: main_widget.setCursor(BIG_CURSOR)
+    else: main_widget.unsetCursor()
+    save_settings()
+
+freeze_btn.clicked.connect(lambda: set_frozen(not video_widget.frozen))
+save_btn.clicked.connect(save_snapshot)
+pointer_btn.clicked.connect(set_big_pointer)
+for keys, fn in (((QtCore.Qt.Key_Space, QtCore.Qt.Key_F), lambda: set_frozen(not video_widget.frozen)),
+                 ((QtCore.Qt.Key_S,), save_snapshot),
+                 ((QtCore.Qt.Key_P,), lambda: set_big_pointer(not BIG_POINTER))):
+    for k in keys:
+        sc = QtWidgets.QShortcut(QtGui.QKeySequence(k), main_widget)
+        sc.setContext(QtCore.Qt.ApplicationShortcut)
+        sc.activated.connect(fn)
+set_frozen(False)
+if BIG_POINTER:
+    set_big_pointer(True)
 
 main_widget.show()
 timer = QtCore.QTimer(); timer.timeout.connect(update); timer.start(50)
