@@ -85,6 +85,10 @@ PAX_OVERLAY = True
 PAX1_POS = (0.20, 0.50)          # Pax1 tap location (bar baseline = zero pressure)
 PAX_SPACING = 0.20               # gap between neighbouring taps, fraction of frame width
 PAX_BAR_SCALE = 0.10             # bar length per 1 bar of pressure, fraction of frame height
+PAX_RATIO_MODE = False           # False: bars in absolute bar; True: p/p0 (p0 = plenum P2). Toggle in sidebar or U.
+PAX_RATIO_SCALE = 0.40           # in p/p0 mode: bar length for p/p0 = 1, fraction of frame height
+PAX_SHOW_AXIS = True             # vertical scale left of the throat, plus the sonic line p*/p0 = 0.528
+SONIC_COLOR = "#FF9100"
 PAX_BAR_WIDTH = 3                # px
 PAX_SHOW_VALUES = True           # small number at the end of each bar
 PAX_DOT_R = 3.5                  # px, solid dot at the end of each bar
@@ -117,6 +121,8 @@ SHOCK_MARKER_COLOR = "#FF1744"
 # as the shock moves upstream past them.
 PAX_SHOW_ISENTROPIC = True
 ISEN_COLOR = "#FFEA00"
+PAX_SHOW_ATM = True              # dashed line at atmospheric (the outlet back pressure): taps below it are sub-atmospheric
+ATM_COLOR = "#FFFFFF"
 
 # Nozzle geometry (shared by the shock solver, nozzle plot and theory reference).
 # Profiles and tap positions are in nozzle_theory.py. Must match the nozzle block fitted:
@@ -127,7 +133,7 @@ NOZZLE_WIDTH_M = 0.008           # constant channel width (design spreadsheet)
 # Transducers: P1/T1 = supply tank (gives tank mass and mass flow), P2/T2 = plenum just upstream
 # of the nozzle. The nozzle stagnation pressure P0 is the plenum, so "p2".
 P0_CHANNEL = "p2"
-P_ATM_PA = 101625.0
+P_ATM_PA = 101325.0               # standard atmosphere; nozzle back pressure and gauge-to-absolute conversion
 
 # --- Load values saved from the sidebar on a previous run ---
 def load_saved_settings():
@@ -558,6 +564,8 @@ class VideoWidget(QtWidgets.QWidget):
         self.pax1 = list(PAX1_POS)
         self.spacing = PAX_SPACING
         self.bar_scale = PAX_BAR_SCALE
+        self.ratio_mode = PAX_RATIO_MODE
+        self.ratio_scale = PAX_RATIO_SCALE
         # View: zoom factor (1 = whole frame fits) and the image point (fractions) at the widget centre
         self.zoom = 1.0
         self.center = [0.5, 0.5]
@@ -652,6 +660,9 @@ class VideoWidget(QtWidgets.QWidget):
         layers = []
         if PAX_OVERLAY and NOZZLE_OUTLINE:
             layers.append(lambda: self._draw_nozzle(p, target))
+        if PAX_OVERLAY:
+            layers.append(lambda: self._draw_axis(p, target))
+            layers.append(lambda: self._draw_atm_line(p, target))   # under the bars
         if PAX_OVERLAY and self._pax is not None:
             layers.append(lambda: self._draw_pax_bars(p, target, self._pax))
             layers.append(lambda: self._draw_theory(p, target))
@@ -746,7 +757,20 @@ class VideoWidget(QtWidgets.QWidget):
         """Screen x of each tap, the zero-pressure baseline y, and pixels per bar."""
         tw, th = target.width(), target.height()
         xs = [target.x() + (self.pax1[0] + i * self.spacing) * tw for i in range(n)]
-        return xs, target.y() + self.pax1[1] * th, self.bar_scale * th
+        scale = self.ratio_scale if self.ratio_mode else self.bar_scale
+        return xs, target.y() + self.pax1[1] * th, scale * th   # px per displayed unit (bar or p/p0)
+
+    def _disp(self, v_bar):
+        """Absolute pressure (bar) -> displayed value: bar, or p/p0 in ratio mode."""
+        if self.ratio_mode:
+            return v_bar / self._p0 if self._p0 and self._p0 > 0 else 0.0
+        return v_bar
+
+    def set_ratio_mode(self, on):
+        self.ratio_mode = bool(on)
+        self.update()
+        self.overlay_changed.emit()
+        save_settings()
 
     @staticmethod
     def _pen(color, width, style=QtCore.Qt.SolidLine):
@@ -756,6 +780,7 @@ class VideoWidget(QtWidgets.QWidget):
 
     def _draw_pax_bars(self, p, target, pax):
         QPF = QtCore.QPointF
+        pax = [self._disp(v) for v in pax]
         xs, y0, px_per_bar = self._geometry(target, len(pax))
         tops = [QPF(x, y0 - v * px_per_bar) for x, v in zip(xs, pax)]
 
@@ -789,6 +814,80 @@ class VideoWidget(QtWidgets.QWidget):
                 p.setPen(self._shadow); p.drawText(QPF(tx + 1, ty + 1), txt)
                 p.setPen(self._color);  p.drawText(QPF(tx, ty), txt)
 
+    def _draw_axis(self, p, target):
+        """Vertical scale just upstream of the throat, and the sonic line p*/p0 = 0.528 along the nozzle."""
+        if not PAX_SHOW_AXIS or self.spacing <= 0:
+            return
+        QPF = QtCore.QPointF
+        _, y0, px_per = self._geometry(target, 1)
+        if px_per <= 0:
+            return
+        x_axis = self._mm_to_screen(target, 0.0, 0).x() - 22
+        if self.ratio_mode:
+            top, minor, major = 1.0, 0.1, 0.2
+        else:
+            top = max(self._p0 or 0.0, P_ATM_PA / 1e5) * 1.1
+            minor, major = (0.25, 0.5) if top <= 3 else (0.5, 1.0)
+            top = math.ceil(top / major) * major
+        col = QtGui.QColor(255, 255, 255, 200)
+        p.setFont(self._font)
+        fm = p.fontMetrics()
+        n = int(round(top / minor))
+        for color, extra in ((self._shadow, 2), (col, 0)):
+            p.setPen(self._pen(color, 1 + extra))
+            p.drawLine(QPF(x_axis, y0), QPF(x_axis, y0 - top * px_per))
+            for i in range(n + 1):
+                v = i * minor
+                is_major = abs(v / major - round(v / major)) < 1e-6
+                y = y0 - v * px_per
+                p.drawLine(QPF(x_axis - (7 if is_major else 4), y), QPF(x_axis, y))
+        for i in range(n + 1):
+            v = i * minor
+            if abs(v / major - round(v / major)) < 1e-6:
+                txt = f"{v:.1f}"
+                y = y0 - v * px_per + fm.ascent() / 2 - 1
+                tx = x_axis - 10 - text_width(fm, txt)
+                p.setPen(self._shadow); p.drawText(QPF(tx + 1, y + 1), txt)
+                p.setPen(col);          p.drawText(QPF(tx, y), txt)
+        unit = "p/p0" if self.ratio_mode else "bar abs"
+        ty = y0 - top * px_per - 8
+        p.setPen(self._shadow); p.drawText(QPF(x_axis - 19, ty + 1), unit)
+        p.setPen(col);          p.drawText(QPF(x_axis - 20, ty), unit)
+
+        # Sonic line: p*/p0 = 0.528 (the throat pressure once choked)
+        crit = nozzle_theory.p_isen(1.0)
+        if not self.ratio_mode and not self._p0:
+            return
+        y = y0 - (crit if self.ratio_mode else crit * self._p0) * px_per
+        x1 = self._mm_to_screen(target, NOZZLE.x_exit, 0).x()
+        sonic = QtGui.QColor(SONIC_COLOR)
+        for color, w in ((self._shadow, 3), (sonic, 1)):
+            p.setPen(self._pen(color, w, QtCore.Qt.DashDotLine))
+            p.drawLine(QPF(x_axis, y), QPF(x1, y))
+        label = (f"p*/p0 {crit:.3f}" if self.ratio_mode else f"p* {crit * self._p0:.2f} bar")
+        ly = y + p.fontMetrics().ascent() + 2   # below its line, so it never collides with the atm label above
+        p.setPen(self._shadow); p.drawText(QPF(x1 + 5, ly + 1), label)
+        p.setPen(sonic);        p.drawText(QPF(x1 + 4, ly), label)
+
+    def _draw_atm_line(self, p, target):
+        """Dashed reference at atmospheric pressure (the nozzle outlet back pressure), along the nozzle."""
+        if not PAX_SHOW_ATM or self.spacing <= 0:
+            return
+        QPF = QtCore.QPointF
+        _, y0, px_per_bar = self._geometry(target, 1)
+        y = y0 - self._disp(P_ATM_PA / 1e5) * px_per_bar
+        x0 = self._mm_to_screen(target, 0.0, 0).x()
+        x1 = self._mm_to_screen(target, NOZZLE.x_exit, 0).x()
+        col = QtGui.QColor(ATM_COLOR); col.setAlpha(200)
+        for color, w in ((self._shadow, 3), (col, 1)):
+            p.setPen(self._pen(color, w, QtCore.Qt.DashLine))
+            p.drawLine(QPF(x0, y), QPF(x1, y))
+        p.setFont(self._font)
+        label = (f"atm  pa/p0 {self._disp(P_ATM_PA / 1e5):.2f}" if self.ratio_mode
+                 else f"atm {P_ATM_PA / 1e5:.2f} bar")
+        p.setPen(self._shadow); p.drawText(QPF(x1 + 5, y + 4), label)
+        p.setPen(col);          p.drawText(QPF(x1 + 4, y + 3), label)
+
     def _draw_theory(self, p, target):
         """Yellow curve: wall pressure for fully supersonic isentropic flow at the measured P0.
         Bars on it = isentropic; bars leaving it = the shock has reached that tap."""
@@ -796,8 +895,8 @@ class VideoWidget(QtWidgets.QWidget):
             return
         QPF = QtCore.QPointF
         _, y0, px_per_bar = self._geometry(target, 1)
-        offset = 0.0
-        pts = [QPF(self._mm_to_screen(target, x, 0).x(), y0 - (self._p0 * r - offset) * px_per_bar)
+        k = 1.0 if self.ratio_mode else self._p0
+        pts = [QPF(self._mm_to_screen(target, x, 0).x(), y0 - k * r * px_per_bar)
                for x, r in zip(self._isen_x, self._isen_ratio)]
         isen = QtGui.QColor(ISEN_COLOR)
         for color, w in ((self._shadow, 4), (isen, 2)):
@@ -812,7 +911,8 @@ class VideoWidget(QtWidgets.QWidget):
         self.pax1[0] += dx
         self.pax1[1] += dy
         self.spacing = max(0.0, self.spacing + dspacing)
-        self.bar_scale *= scale_mult
+        if self.ratio_mode: self.ratio_scale *= scale_mult
+        else: self.bar_scale *= scale_mult
         self.update()
         self.overlay_changed.emit()
         save_settings()
@@ -824,6 +924,8 @@ class VideoWidget(QtWidgets.QWidget):
                 self.pax1 = [float(v) for v in SAVED["pax1_pos"]]
                 self.spacing = float(SAVED["spacing"])
                 self.bar_scale = float(SAVED["bar_scale"])
+            self.ratio_mode = bool(SAVED.get("ratio_mode", self.ratio_mode))
+            self.ratio_scale = float(SAVED.get("ratio_scale", self.ratio_scale))
             if "zoom" in SAVED:
                 self.zoom = float(SAVED["zoom"])
                 self.center = [float(v) for v in SAVED["view_center"]]
@@ -834,6 +936,8 @@ class VideoWidget(QtWidgets.QWidget):
         return {"pax1_pos": [round(v, 4) for v in self.pax1],
                 "spacing": round(self.spacing, 4),
                 "bar_scale": round(self.bar_scale, 4),
+                "ratio_mode": self.ratio_mode,
+                "ratio_scale": round(self.ratio_scale, 4),
                 "zoom": round(self.zoom, 4),
                 "view_center": [round(v, 4) for v in self.center]}
 
@@ -842,7 +946,7 @@ class VideoWidget(QtWidgets.QWidget):
         if self._target is None or self._pax is None:
             return None
         xs, y0, px_per_bar = self._geometry(self._target, len(self._pax))
-        tops = [y0 - v * px_per_bar for v in self._pax]
+        tops = [y0 - self._disp(v) * px_per_bar for v in self._pax]
         def near_bar(i):
             return abs(pos.x() - xs[i]) < 12 and min(y0, tops[i]) - 12 <= pos.y() <= max(y0, tops[i]) + 12
         if len(xs) > 1 and near_bar(len(xs) - 1):
@@ -907,7 +1011,9 @@ def make_overlay_controls(vw):
     def refresh():
         readout.setText(f"PAX1_POS = ({vw.pax1[0]:.3f}, {vw.pax1[1]:.3f})\n"
                         f"PAX_SPACING = {vw.spacing:.3f}\n"
-                        f"PAX_BAR_SCALE = {vw.bar_scale:.3f}")
+                        f"PAX_BAR_SCALE = {vw.bar_scale:.3f}\n"
+                        f"PAX_RATIO_SCALE = {vw.ratio_scale:.3f}")
+        bar_btn.setChecked(not vw.ratio_mode); ratio_btn.setChecked(vw.ratio_mode)
 
     def btn(text, tip, **kw):
         b = QtWidgets.QToolButton(); b.setText(text); b.setToolTip(tip)
@@ -928,6 +1034,17 @@ def make_overlay_controls(vw):
     rows.append(("View", [view_btn("−", "Zoom out", lambda: vw.zoom_at(1 / 1.2)),
                           view_btn("+", "Zoom in", lambda: vw.zoom_at(1.2)),
                           view_btn("Fit", "Show the whole frame", vw.reset_view)]))
+    # Units: absolute bar or p/p0 (U toggles)
+    bar_btn, ratio_btn = QtWidgets.QToolButton(), QtWidgets.QToolButton()
+    for b, text, tip, on in ((bar_btn, "bar", "Bars and curve in absolute bar", False),
+                             (ratio_btn, "p/p0", "Bars and curve as p/p0 (p0 = plenum P2): the curve stays fixed", True)):
+        b.setText(text); b.setToolTip(tip + " (U toggles)"); b.setCheckable(True)
+        b.setStyleSheet("QToolButton:checked { background: #00E5FF; color: black; }")
+        b.clicked.connect(lambda _, on=on: vw.set_ratio_mode(on))
+    rows.insert(0, ("Units", [bar_btn, ratio_btn]))
+    sc_u = QtWidgets.QShortcut(QtGui.QKeySequence("U"), box)
+    sc_u.setContext(QtCore.Qt.ApplicationShortcut)
+    sc_u.activated.connect(lambda: vw.set_ratio_mode(not vw.ratio_mode))
     for r, (name, buttons) in enumerate(rows):
         g.addWidget(QtWidgets.QLabel(name), r, 0)
         for c, b in enumerate(buttons):
@@ -935,7 +1052,7 @@ def make_overlay_controls(vw):
     g.addWidget(readout, len(rows), 0, 1, 5)
     hint = QtWidgets.QLabel("Drag Pax1/baseline to move, last bar for spacing.\n"
                             "Scroll/pinch to zoom, drag the video to pan.\n"
-                            "Keys: arrows move (Shift ×5), [ ] spacing, − = scale")
+                            "Keys: arrows move (Shift ×5), [ ] spacing, − = scale, U units")
     hint.setStyleSheet("color: #777; font-size: 10px;")
     g.addWidget(hint, len(rows) + 1, 0, 1, 5)
 

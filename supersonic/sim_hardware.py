@@ -58,7 +58,7 @@ class FakeThermocouple:
         return self.base_c - 8.0 * (1 - frac) + random.gauss(0, 0.05)
 
 
-P_ATM = 1.01625
+P_ATM = 1.01325   # bar, standard atmosphere (matches P_ATM_PA in prc.py)
 
 def plenum_abs_bar():
     """Plenum (nozzle stagnation) absolute pressure, bar."""
